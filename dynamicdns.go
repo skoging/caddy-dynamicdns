@@ -38,7 +38,7 @@ type App struct {
 	// The sources from which to get the server's public IP address.
 	// Multiple sources can be specified for redundancy.
 	// Default: simple_http
-	IPSourcesRaw []json.RawMessage `json:"ip_sources,omitempty" caddy:"namespace=dynamic_dns.ip_sources inline_key=source"`
+	RecordTargetSourcesRaw []json.RawMessage `json:"ip_sources,omitempty" caddy:"namespace=dynamic_dns.ip_sources inline_key=source"`
 
 	// The configuration for the DNS provider with which the DNS
 	// records will be updated.
@@ -67,8 +67,8 @@ type App struct {
 	// The TTL to set on DNS records.
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
-	ipSources   []IPSource
-	dnsProvider libdns.RecordSetter
+	targetSources []RecordTargetSource
+	dnsProvider   libdns.RecordSetter
 
 	ctx    caddy.Context
 	logger *zap.Logger
@@ -98,21 +98,21 @@ func (a *App) Provision(ctx caddy.Context) error {
 	a.dnsProvider = val.(libdns.RecordSetter)
 
 	// set up the IP source module or use a default
-	if a.IPSourcesRaw != nil {
-		vals, err := ctx.LoadModule(a, "IPSourcesRaw")
+	if a.RecordTargetSourcesRaw != nil {
+		vals, err := ctx.LoadModule(a, "RecordTargetSourcesRaw")
 		if err != nil {
 			return fmt.Errorf("loading IP source module: %v", err)
 		}
 		for _, val := range vals.([]interface{}) {
-			a.ipSources = append(a.ipSources, val.(IPSource))
+			a.targetSources = append(a.targetSources, val.(RecordTargetSource))
 		}
 	}
-	if len(a.ipSources) == 0 {
+	if len(a.targetSources) == 0 {
 		var sh SimpleHTTP
 		if err = sh.Provision(ctx); err != nil {
 			return err
 		}
-		a.ipSources = []IPSource{sh}
+		a.targetSources = []RecordTargetSource{sh}
 	}
 
 	// make sure a check interval is set
@@ -160,16 +160,16 @@ func (a App) checkerLoop() {
 func (a App) checkIPAndUpdateDNS() {
 	a.logger.Debug("beginning IP address check")
 
-	lastIPsMu.Lock()
-	defer lastIPsMu.Unlock()
+	lastRecordsMu.Lock()
+	defer lastRecordsMu.Unlock()
 
 	var err error
 
 	allDomains := a.allDomains()
 
 	// if we don't know current IPs for this domain, look them up from DNS
-	if lastIPs == nil {
-		lastIPs, err = a.lookupCurrentIPsFromDNS(allDomains)
+	if lastRecords == nil {
+		lastRecords, err = a.lookupCurrentRecordsFromDNS(allDomains)
 		if err != nil {
 			// not the end of the world, but might be an extra initial API hit with the DNS provider
 			a.logger.Error("unable to lookup current IPs from DNS records", zap.Error(err))
@@ -177,10 +177,10 @@ func (a App) checkIPAndUpdateDNS() {
 	}
 
 	// look up current address(es) from first successful IP source
-	var currentIPs []net.IP
-	for _, ipSrc := range a.ipSources {
-		currentIPs, err = ipSrc.GetIPs(a.ctx, a.Versions)
-		if len(currentIPs) == 0 {
+	var targets []libdns.Record
+	for _, ipSrc := range a.targetSources {
+		targets, err = ipSrc.GetTargets(a.ctx, a.Versions)
+		if len(targets) == 0 {
 			err = fmt.Errorf("no IP addresses returned")
 		}
 		if err == nil {
@@ -192,31 +192,43 @@ func (a App) checkIPAndUpdateDNS() {
 	}
 
 	// make sure the source returns tidy info; duplicates are wasteful
-	currentIPs = removeDuplicateIPs(currentIPs)
+	targets = removeDuplicateRecords(targets)
 
 	// do a simple diff of current and previous IPs to make DNS records to update
 	updatedRecsByZone := make(map[string][]libdns.Record)
-	for _, ip := range currentIPs {
-		if ipListContains(lastIPs, ip) && !ipListContains(lastIPs, nilIP) {
-			continue // IP is not different and no new domains to manage; no update needed
-		}
-
-		oldIPStrings := make([]string, len(lastIPs))
-		for i, val := range lastIPs {
-			oldIPStrings[i] = val.String()
-		}
-		a.logger.Info("different IP address",
-			zap.String("new_ip", ip.String()),
-			zap.Strings("old_ips", oldIPStrings))
-
+	for _, record := range targets {
 		for zone, domains := range allDomains {
 			for _, domain := range domains {
-				updatedRecsByZone[zone] = append(updatedRecsByZone[zone], libdns.Record{
-					Type:  recordType(ip),
+				var currentRecords []libdns.Record
+				for _, rec := range lastRecords[zone] {
+					if rec.Name == domain && rec.Type == record.Type {
+						currentRecords = append(currentRecords, rec)
+					}
+				}
+
+				if len(currentRecords) > 1 {
+					a.logger.Warn("unexpectedly found more than 1 existing record", zap.String("zone", zone), zap.String("name", domain), zap.String("type", record.Type))
+					// continue
+				}
+
+				var lastRecord libdns.Record
+				if len(currentRecords) == 1 {
+					lastRecord = currentRecords[0]
+
+					if lastRecord.Value == record.Value {
+						continue
+					}
+				}
+
+				newRecord := libdns.Record{
+					ID:    lastRecord.ID,
+					Type:  record.Type,
 					Name:  domain,
-					Value: ip.String(),
+					Value: record.Value,
 					TTL:   time.Duration(a.TTL),
-				})
+				}
+
+				updatedRecsByZone[zone] = append(updatedRecsByZone[zone], newRecord)
 			}
 		}
 	}
@@ -236,32 +248,32 @@ func (a App) checkIPAndUpdateDNS() {
 				zap.Duration("ttl", rec.TTL),
 			)
 		}
-		_, err = a.dnsProvider.SetRecords(a.ctx, zone, records)
+		newRecs, err := a.dnsProvider.SetRecords(a.ctx, zone, records)
 		if err != nil {
 			a.logger.Error("failed setting DNS record(s) with new IP address(es)",
 				zap.String("zone", zone),
 				zap.Error(err),
 			)
 		}
+
+		for _, newRec := range newRecs {
+			if lastRecords[zone] == nil {
+				lastRecords[zone] = make(map[string]libdns.Record)
+			}
+
+			lastRecords[zone][newRec.ID] = newRec
+		}
+
 	}
 
-	currentIPStrings := make([]string, len(currentIPs))
-	for i, val := range currentIPs {
-		currentIPStrings[i] = val.String()
-	}
-	a.logger.Info("finished updating DNS",
-		zap.Strings("current_ips", currentIPStrings))
-
-	lastIPs = currentIPs
+	a.logger.Info("finished updating DNS")
 }
 
-// lookupCurrentIPsFromDNS looks up the current IP addresses
+// lookupCurrentRecordsFromDNS looks up the current IP addresses
 // from DNS records.
-func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) ([]net.IP, error) {
-	types := []string{recordTypeA, recordTypeAAAA}
+func (a App) lookupCurrentRecordsFromDNS(domains map[string][]string) (map[string]map[string]libdns.Record, error) {
 
-	// avoid duplicates
-	currentIPs := make(map[string]net.IP)
+	currentRecords := make(map[string]map[string]libdns.Record)
 
 	if recordGetter, ok := a.dnsProvider.(libdns.RecordGetter); ok {
 		for zone, names := range domains {
@@ -270,39 +282,32 @@ func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) ([]net.IP, err
 				return nil, err
 			}
 
-			recMap := make(map[string]net.IP)
 			for _, r := range recs {
-				if r.Type != recordTypeA && r.Type != recordTypeAAAA {
+				if !stringListContains(names, r.Name) {
 					continue
 				}
-				ip := net.ParseIP(r.Value)
-				if ip != nil {
-					recMap[r.Type+"|"+r.Name] = ip
-				} else {
-					a.logger.Error("invalid IP address found in current DNS record", zap.String("A", r.Value))
+
+				if currentRecords[zone] == nil {
+					currentRecords[zone] = make(map[string]libdns.Record)
 				}
-			}
-			for _, n := range names {
-				for _, t := range types {
-					ip, ok := recMap[t+"|"+n]
-					if ok {
-						currentIPs[ip.String()] = ip
-					} else {
-						a.logger.Info("domain not found in DNS", zap.String("domain", n))
-						currentIPs[nilIP.String()] = nilIP
-					}
-				}
+
+				currentRecords[zone][r.ID] = r
 			}
 		}
 	}
 
-	// convert into a slice
-	ips := make([]net.IP, 0, len(currentIPs))
-	for _, ip := range currentIPs {
-		ips = append(ips, ip)
-	}
+	return currentRecords, nil
+}
 
-	return ips, nil
+func makeRecords(ips []net.IP) []libdns.Record {
+	var records []libdns.Record
+	for _, ip := range ips {
+		records = append(records, libdns.Record{
+			Type:  recordType(ip),
+			Value: ip.String(),
+		})
+	}
+	return records
 }
 
 func (a App) lookupManagedDomains() ([]string, error) {
@@ -375,21 +380,44 @@ func recordType(ip net.IP) string {
 	return recordTypeA
 }
 
-// removeDuplicateIPs returns ips without duplicates.
-func removeDuplicateIPs(ips []net.IP) []net.IP {
-	var clean []net.IP
-	for _, ip := range ips {
-		if !ipListContains(clean, ip) {
-			clean = append(clean, ip)
+// removeDuplicateRecords returns ips without duplicates.
+func removeDuplicateRecords(records []libdns.Record) []libdns.Record {
+	var clean []libdns.Record
+	for _, record := range records {
+		if !recordListContains(clean, record) {
+			clean = append(clean, record)
 		}
 	}
 	return clean
+}
+
+// recordListContains returns true if list contains ip; false otherwise.
+func recordListContains(list []libdns.Record, record libdns.Record) bool {
+	for _, recordInList := range list {
+		if record.ID != "" && recordInList.ID == record.ID {
+			return true
+		}
+
+		if recordInList.Value == record.Value && recordInList.Type == record.Type && recordInList.Name == record.Name {
+			return true
+		}
+	}
+	return false
 }
 
 // ipListContains returns true if list contains ip; false otherwise.
 func ipListContains(list []net.IP, ip net.IP) bool {
 	for _, ipInList := range list {
 		if ipInList.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringListContains(list []string, s string) bool {
+	for _, val := range list {
+		if val == s {
 			return true
 		}
 	}
@@ -418,11 +446,11 @@ func (ip IPVersions) V6Enabled() bool {
 // time a new config is loaded; the IPs are
 // unlikely to change very often.
 var (
-	lastIPs   []net.IP
-	lastIPsMu sync.Mutex
+	lastRecords   map[string]map[string]libdns.Record
+	lastRecordsMu sync.Mutex
 
 	// Special value indicate there is a new domain to manage.
-	nilIP net.IP
+	nilRecord libdns.Record
 )
 
 const (

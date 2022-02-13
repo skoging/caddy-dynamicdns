@@ -102,7 +102,7 @@ func parseApp(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
 			if err != nil {
 				return nil, err
 			}
-			app.IPSourcesRaw = append(app.IPSourcesRaw, caddyconfig.JSONModuleObject(unm, "source", sourceType, nil))
+			app.RecordTargetSourcesRaw = append(app.RecordTargetSourcesRaw, caddyconfig.JSONModuleObject(unm, "source", sourceType, nil))
 
 		case "versions":
 			args := d.RemainingArgs()
