@@ -31,6 +31,75 @@ func Test_ParseApp(t *testing.T) {
 		wantErr bool
 	}{
 		{
+			name: "static ipv4 source",
+			d: caddyfile.NewTestDispenser(`
+			dynamic_dns {
+				ip_source static 127.0.0.1 5m
+			}`),
+			want: ` {
+				"ip_sources": [
+					{
+						"source": "static",
+						"targets": [{
+							"ID": "",
+							"Name": "",
+							"Priority": 0,
+							"TTL": 300000000000,
+							"Type": "A",
+							"Value": "127.0.0.1"
+						}]
+					}
+				],
+				"versions": {}
+			}`,
+		},
+		{
+			name: "static ipv6 source",
+			d: caddyfile.NewTestDispenser(`
+			dynamic_dns {
+				ip_source static 0:0:0:0:0:0:0:1 5m
+			}`),
+			want: ` {
+				"ip_sources": [
+					{
+						"source": "static",
+						"targets": [{
+							"ID": "",
+							"Name": "",
+							"Priority": 0,
+							"TTL": 300000000000,
+							"Type": "AAAA",
+							"Value": "::1"
+						}]
+					}
+				],
+				"versions": {}
+			}`,
+		},
+		{
+			name: "static cname source",
+			d: caddyfile.NewTestDispenser(`
+			dynamic_dns {
+				ip_source static localhost 5m
+			}`),
+			want: ` {
+				"ip_sources": [
+					{
+						"source": "static",
+						"targets": [{
+							"ID": "",
+							"Name": "",
+							"Priority": 0,
+							"TTL": 300000000000,
+							"Type": "CNAME",
+							"Value": "localhost"
+						}]
+					}
+				],
+				"versions": {}
+			}`,
+		},
+		{
 			name: "ip_source: upnp",
 			d: caddyfile.NewTestDispenser(`
 			dynamic_dns {
@@ -41,7 +110,8 @@ func Test_ParseApp(t *testing.T) {
 					{
 						"source": "upnp"
 					}
-				]
+				],
+				"versions": {}
 			}`,
 		},
 		{
@@ -61,7 +131,8 @@ func Test_ParseApp(t *testing.T) {
 						"source": "simple_http",
 						"endpoints": ["http://2.com"]
 					}
-				]
+				],
+				"versions": {}
 			}`,
 		},
 		{
@@ -85,7 +156,8 @@ func Test_ParseApp(t *testing.T) {
 						"source": "simple_http",
 						"endpoints": ["http://2.com"]
 					}
-				]
+				],
+				"versions": {}
 			}`,
 		},
 		{

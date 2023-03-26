@@ -27,12 +27,18 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	upnp "gitlab.com/NebulousLabs/go-upnp"
+	"github.com/libdns/libdns"
 	"go.uber.org/zap"
 )
 
 func init() {
 	caddy.RegisterModule(SimpleHTTP{})
 	caddy.RegisterModule(UPnP{})
+	caddy.RegisterModule(StaticSource{})
+}
+
+type RecordTargetSource interface {
+	GetTargets(context.Context, IPVersions) ([]libdns.Record, error)
 }
 
 // IPSource is a type that can get IP addresses.
@@ -90,6 +96,11 @@ func (sh *SimpleHTTP) Provision(ctx caddy.Context) error {
 		sh.Endpoints = defaultHTTPIPServices
 	}
 	return nil
+}
+
+func (sh SimpleHTTP) GetTargets(ctx context.Context, versions IPVersions) ([]libdns.Record, error) {
+	var ips, err = sh.GetIPs(ctx, versions)
+	return makeRecords(ips), err
 }
 
 // GetIPs gets the public addresses of this machine.
@@ -213,6 +224,11 @@ func (u *UPnP) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+func (u UPnP) GetTargets(ctx context.Context, versions IPVersions) ([]libdns.Record, error) {
+	var ips, err = u.GetIPs(ctx, versions)
+	return makeRecords(ips), err
+}
+
 // GetIPs gets the public address(es) of this machine.
 // This implementation ignores the configured IP versions, since
 // we can't really choose whether we're looking for IPv4 or IPv6
@@ -238,13 +254,76 @@ func (u UPnP) GetIPs(ctx context.Context, _ IPVersions) ([]net.IP, error) {
 	return []net.IP{ip}, nil
 }
 
+type StaticSource struct {
+	// The list of endpoints to point to
+	Targets []libdns.Record `json:"targets"`
+}
+
+func (StaticSource) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "dynamic_dns.ip_sources.static",
+		New: func() caddy.Module { return new(StaticSource) },
+	}
+}
+
+func (ss *StaticSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	var (
+		unused  string
+		value   string
+		dur     string
+		dnsType string
+	)
+	if !d.Args(&unused, &value, &dur) {
+		return d.ArgErr()
+	}
+
+	ttl, err := caddy.ParseDuration(dur)
+	if err != nil {
+		return err
+	}
+
+	ip := net.ParseIP(value)
+	if ip != nil {
+		if !d.NextArg() {
+			dnsType = recordType(ip)
+		} else {
+			dnsType = d.Val()
+		}
+		value = ip.String()
+	} else {
+		if !d.NextArg() {
+			dnsType = "CNAME"
+		} else {
+			dnsType = d.Val()
+		}
+	}
+
+	ss.Targets = append(ss.Targets, libdns.Record{
+		Type:  dnsType,
+		Value: value,
+		TTL:   ttl,
+	})
+
+	return nil
+}
+
+// GetIPs gets the public address(es) of this machine.
+func (ss StaticSource) GetTargets(ctx context.Context, _ IPVersions) ([]libdns.Record, error) {
+	return ss.Targets, nil
+}
+
 // Interface guards
 var (
 	_ IPSource              = (*SimpleHTTP)(nil)
+	_ RecordTargetSource    = (*SimpleHTTP)(nil)
 	_ caddy.Provisioner     = (*SimpleHTTP)(nil)
 	_ caddyfile.Unmarshaler = (*SimpleHTTP)(nil)
 
 	_ IPSource              = (*UPnP)(nil)
+	_ RecordTargetSource    = (*UPnP)(nil)
 	_ caddy.Provisioner     = (*UPnP)(nil)
 	_ caddyfile.Unmarshaler = (*UPnP)(nil)
+
+	_ RecordTargetSource    = (*StaticSource)(nil)
+	_ caddyfile.Unmarshaler = (*StaticSource)(nil)
 )
